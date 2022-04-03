@@ -1,0 +1,181 @@
+---
+title: "P-splines"
+author: "Monica Alexander"
+date: "22/03/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+In this lab you'll be fitting a second-order P-Splines regression model to foster care entries by state in the US, projecting out to 2030. 
+
+```{r}
+library(tidyverse)
+library(here)
+library(rstan)
+library(tidybayes)
+source(here("code/getsplines.R"))
+library(geofacet)
+library(ggplot2)
+```
+
+
+
+Here's the data
+
+```{r}
+d <- read_csv(here("data/fc_entries.txt"))
+```
+
+## Question 1
+
+Make a plot highlighting trends over time by state. Might be a good opportunity to use `geofacet`. Describe what you see in a couple of sentences. 
+
+
+
+
+```{r}
+ggplot(d, aes(year, ent, fill = ent)) +
+  geom_line() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  theme(strip.text.x = element_text(size = 5)) +
+  labs(title = "foster care entries per capita trends over time by state",
+       x = "years", y = "entries per capita")+
+  facet_geo(~ state, grid = "us_state_grid2",scales = "free_y")
+```
+
+We see the in many states there's an increasing trend of foster care entries. I suspect that there's a correlation between adjacent states.
+
+
+## Question 2
+
+Fit a hierarchical second-order P-Splines regression model to estimate the (logged) entries per capita over the period 2010-2017. The model you want to fit is
+
+$$
+\begin{aligned}
+y_{st} &\sim N(\log \lambda_{st}, \sigma^2_{y,s})\\
+\log \lambda_{st} &= \alpha_kB_k(t)\\
+\Delta^2\alpha_k &\sim N(0, \sigma^2_{\alpha,s})\\
+\log \sigma_{\alpha,s} &\sim N(\mu_{\sigma}, \tau^2)
+\end{aligned}
+$$
+Where $y_{s,t}$ is the logged entries per capita for state $s$ in year $t$. Use cubic splines that have knots 2.5 years apart and are a constant shape at the boundaries. Put standard normal priors on standard deviations and hyperparameters. 
+
+```{r}
+x.i <- d[1:8,]$ent
+I <- 2.5 # between-knot length
+res <- getsplines(x.i, I = I) # a function from distortr, to get splines of constant shape
+B.ik <- res$B.ik
+x.i[1] # look at first value of BMI
+
+```
+```{r}
+I <- 2.5
+res <- getsplines(d$year, I = I)
+stan_data <- list(nb = ncol(res$B.ik),
+                   ns = length(unique(d$state)),
+                   ny = length(unique(d$year)),
+                   Y = matrix(log(d$ent_pc), ncol = 51),
+                   B = res$B.ik[1:length(unique(d$year)), ])
+mod <- stan(data = stan_data,
+             file = "spline.stan",
+             iter = 5000,
+             seed = 2)
+```
+
+
+
+## Question 3
+
+Project forward entries per capita to 2030. Pick 4 states and plot the results (with 95% CIs). Note the code to do this in R is in the lecture slides. 
+
+```{r}
+years <- 2010:2017
+proj_years <- 2018:2030
+B.ik_full <- getsplines(c(2010:2017, proj_years), I = 2.5)$B.ik
+K <- ncol(res$B.ik)
+K_full <- ncol(B.ik_full)
+proj_steps <- K_full - K
+alphas <- extract(mod)[["alpha"]]
+sigmas <- exp(extract(mod)[["log_sigma_alpha"]])
+sigma_ys <- extract(mod)[["sigma"]]
+nsims <- nrow(alphas)
+states <- unique(d$state)
+alphas_proj <- array(NA, c(nsims, proj_steps, length(states)))
+set.seed(1098)
+for(j in 1:length(states)){
+  first_next_alpha <- rnorm(n = nsims, mean = 2*alphas[, K,j] - alphas[, K-1,j], sd = 
+                              sigmas[,j])
+  second_next_alpha <- rnorm(n = nsims, mean = 2*first_next_alpha - alphas[, K,j], sd =
+                               sigmas[,j])
+alphas_proj[,1,j] <- first_next_alpha
+alphas_proj[,2,j] <- second_next_alpha
+for(i in 3:proj_steps){
+
+  alphas_proj[,i,j] <- rnorm(n = nsims,
+                             mean = 2*alphas_proj[,i-1,j] - alphas_proj[,i-2,j],
+                             sd = sigmas[,j])
+  }
+}
+y_proj <- array(NA, c(nsims, length(proj_years), length(states)))
+for(i in 1:length(proj_years)){
+  for(j in 1:length(states)){
+    all_alphas <- cbind(alphas[,,j], alphas_proj[,,j] )
+    this_lambda <- all_alphas %*% as.matrix(B.ik_full[length(years)+i, ])
+    y_proj[,i,j] <- rnorm(n = nsims, mean = this_lambda, sd = sigma_ys[,j])
+    }
+}
+
+
+res1 <- mod %>%
+  gather_draws(Y_rep[condition1, condition2]) %>%
+  median_qi()
+colnames(res1)[1:2] <- c("year", "state")
+index <- which(states %in% c("California", "Mississippi", "Ohio", "Texas"))
+res2 <- matrix(NA, nrow = 663, ncol = 5)
+res2[, 1] <- rep(1:length(proj_years), each = 51)
+res2[, 2] <- rep(1:51, length(proj_years))
+colnames(res2) <- c("year", "state", ".value", ".lower", ".upper")
+res2 <- data.frame(res2)
+for (i in 1:663) {
+  res2[i, ".value"] <- median(y_proj[, res2$year[i], res2$state[i]])
+  res2[i, ".lower"] <- quantile(y_proj[, res2$year[i], res2$state[i]], 0.025)
+  res2[i, ".upper"] <- quantile(y_proj[, res2$year[i], res2$state[i]], 0.975)
+}
+res1_plot <- res1 %>%
+  filter(state %in% index)
+res1_plot$year <- rep(years, each = 4)
+res1_plot$state <- rep(c("California", "Mississippi", "Ohio", "Texas"),
+                       length(unique(res1_plot$year)))
+res2_plot <- res2 %>%
+  filter(state %in% index)
+res2_plot$year <- rep(proj_years, each = 4)
+res2_plot$state <- rep(c("California", "Mississippi", "Ohio", "Texas"),
+                       length(unique(res2_plot$year)))
+d_plot <- d %>%
+  filter(state %in% c("California", "Mississippi", "Ohio", "Texas"))
+d_plot$log_ent_pc <- log(d_plot$ent_pc)
+ggplot(d_plot, aes(year, log_ent_pc)) +
+  geom_point(aes(color = state)) +
+  geom_line(data = res1_plot, aes(year, .value, col = state)) +
+  geom_ribbon(data = res1_plot, aes(x = year, y = .value, ymin = .lower, ymax = .upper, fill =
+                                      state), alpha = 0.2) +
+  theme_bw() +
+  geom_line(data = res2_plot, aes(year, .value, col=state)) +
+  geom_point(data = res2_plot, aes(year, .value, col=state)) +
+  geom_ribbon(data = res2_plot, aes(y = .value, ymin = .lower, ymax = .upper, fill=state), alpha
+              = 0.2) +
+  theme_bw() +
+  labs(title = "Estimated and projected entries per capita second order P splines",
+       y = "log entries per capita")
+```
+
+
+
